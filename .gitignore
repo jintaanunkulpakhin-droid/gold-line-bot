@@ -1,0 +1,4 @@
+config.json
+latest_chart.png
+__pycache__/
+*.pyc
