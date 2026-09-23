@@ -53,6 +53,8 @@ def callback():
         abort(400)
 
     for event in request.get_json().get("events", []):
+        if event.get("type") in ("join", "leave", "memberLeft"):
+            print(f"[{event['type']}] source={event.get('source')} timestamp={event.get('timestamp')}")
         if event.get("type") != "message":
             continue
         if event.get("deliveryContext", {}).get("isRedelivery"):
