@@ -1,8 +1,11 @@
 import base64
 import hashlib
 import hmac
+import json
+import os
 from pathlib import Path
 
+import requests
 from flask import Flask, request, abort
 
 from gold_bot import (
@@ -11,12 +14,24 @@ from gold_bot import (
     make_chart,
     summarize_trend,
     upload_image,
+    CONFIG_PATH,
 )
 
 TRIGGER_WORD = "gold"
 
 app = Flask(__name__)
 config = load_config()
+
+
+def get_telegram_config():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    if token and secret:
+        return token, secret
+    if CONFIG_PATH.exists():
+        local = json.loads(CONFIG_PATH.read_text())
+        return local.get("telegram_bot_token"), local.get("telegram_webhook_secret")
+    return None, None
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -26,8 +41,6 @@ def verify_signature(body: bytes, signature: str) -> bool:
 
 
 def reply_to_line(reply_token, image_url, summary_text):
-    import requests
-
     resp = requests.post(
         "https://api.line.me/v2/bot/message/reply",
         headers={
@@ -74,6 +87,43 @@ def callback():
             reply_to_line(event["replyToken"], image_url, summary)
         except Exception as exc:
             print(f"Failed to handle trigger event: {exc}")
+
+    return "OK"
+
+
+def send_photo_telegram(token, chat_id, image_path, caption):
+    with open(image_path, "rb") as f:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": f},
+            timeout=30,
+        )
+    resp.raise_for_status()
+
+
+@app.route("/telegram_callback", methods=["POST"])
+def telegram_callback():
+    token, secret = get_telegram_config()
+    if not token or not secret:
+        abort(503)
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+        abort(403)
+
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or update.get("edited_message") or {}
+    text = message.get("text", "")
+    if TRIGGER_WORD not in text.lower():
+        return "OK"
+
+    try:
+        intraday_df = fetch_intraday_prices()
+        chart_path = Path(__file__).parent / "latest_chart_tg.png"
+        make_chart(intraday_df, chart_path)
+        summary = summarize_trend(intraday_df)
+        send_photo_telegram(token, message["chat"]["id"], chart_path, summary)
+    except Exception as exc:
+        print(f"Failed to handle Telegram trigger event: {exc}")
 
     return "OK"
 
