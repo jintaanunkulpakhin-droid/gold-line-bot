@@ -8,10 +8,12 @@ import requests
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import mplfinance as mpf
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 CHART_DAYS = 90
+CANDLE_INTERVAL = "15m"
+CANDLE_COUNT = 100
 CONFIG_KEYS = [
     "line_channel_access_token",
     "line_group_id",
@@ -56,22 +58,51 @@ def fetch_gold_prices():
     return df
 
 
-def make_chart(df, out_path):
-    df = df.copy()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA50"] = df["Close"].rolling(50).mean()
+def fetch_intraday_prices(interval=CANDLE_INTERVAL, range_param="5d"):
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
+    resp = requests.get(
+        url,
+        params={"range": range_param, "interval": interval},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    result = resp.json()["chart"]["result"][0]
+    quote = result["indicators"]["quote"][0]
+    df = pd.DataFrame({
+        "Date": pd.to_datetime(result["timestamp"], unit="s"),
+        "Open": quote["open"],
+        "High": quote["high"],
+        "Low": quote["low"],
+        "Close": quote["close"],
+        "Volume": quote.get("volume", [0] * len(result["timestamp"])),
+    }).dropna(subset=["Open", "High", "Low", "Close"])
+    df = df.sort_values("Date").tail(CANDLE_COUNT).set_index("Date")
+    if df.empty:
+        raise RuntimeError("Yahoo Finance returned no intraday gold price data")
+    return df
 
-    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=150)
-    ax.plot(df["Date"], df["Close"], label="XAU/USD", color="#c9a227", linewidth=2)
-    ax.plot(df["Date"], df["MA20"], label="MA20", color="#4a90d9", linewidth=1, linestyle="--")
-    ax.plot(df["Date"], df["MA50"], label="MA50", color="#9b59b6", linewidth=1, linestyle="--")
-    ax.set_title(f"Gold (XAU/USD futures) — last {CHART_DAYS} trading days")
-    ax.legend(loc="upper left")
-    ax.grid(alpha=0.3)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
+
+def make_chart(df, out_path):
+    # TradingView-style dark candlestick chart, M15 candles.
+    market_colors = mpf.make_marketcolors(
+        up="#26a69a", down="#ef5350",
+        edge="inherit", wick="inherit", volume="in",
+    )
+    style = mpf.make_mpf_style(
+        base_mpf_style="nightclouds",
+        marketcolors=market_colors,
+        facecolor="#131722", figcolor="#131722", edgecolor="#131722",
+        gridcolor="#2a2e39", gridstyle="--",
+        rc={"axes.labelcolor": "#d1d4dc", "xtick.color": "#d1d4dc", "ytick.color": "#d1d4dc"},
+    )
+    mpf.plot(
+        df, type="candle", style=style,
+        title=f"\nGold (XAU/USD futures) — M15, last {len(df)} candles",
+        ylabel="Price (USD)",
+        figsize=(10, 5.5),
+        savefig=dict(fname=str(out_path), dpi=150),
+    )
 
 
 def summarize_trend(df):
@@ -133,9 +164,10 @@ def send_to_line(channel_access_token, group_id, image_url, summary_text):
 def main():
     config = load_config()
     df = fetch_gold_prices()
+    intraday_df = fetch_intraday_prices()
 
     chart_path = Path(__file__).parent / "latest_chart.png"
-    make_chart(df, chart_path)
+    make_chart(intraday_df, chart_path)
 
     summary = summarize_trend(df)
     image_url = upload_image(config["imgbb_api_key"], chart_path)

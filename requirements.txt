@@ -1,5 +1,6 @@
 pandas
 matplotlib
+mplfinance
 requests
 flask
 gunicorn
