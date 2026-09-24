@@ -7,7 +7,6 @@ from flask import Flask, request, abort
 
 from gold_bot import (
     load_config,
-    fetch_gold_prices,
     fetch_intraday_prices,
     make_chart,
     summarize_trend,
@@ -67,11 +66,10 @@ def callback():
             continue
 
         try:
-            df = fetch_gold_prices()
             intraday_df = fetch_intraday_prices()
             chart_path = Path(__file__).parent / "latest_chart.png"
             make_chart(intraday_df, chart_path)
-            summary = summarize_trend(df)
+            summary = summarize_trend(intraday_df)
             image_url = upload_image(config["imgbb_api_key"], chart_path)
             reply_to_line(event["replyToken"], image_url, summary)
         except Exception as exc:

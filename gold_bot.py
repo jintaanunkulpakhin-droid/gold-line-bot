@@ -1,5 +1,4 @@
 import json
-import io
 import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -11,9 +10,9 @@ matplotlib.use("Agg")
 import mplfinance as mpf
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-CHART_DAYS = 90
-CANDLE_INTERVAL = "15m"
+CANDLE_INTERVAL = "5m"
 CANDLE_COUNT = 100
+SWING_ORDER = 3  # candles on each side that must be lower/higher to count as a swing point
 CONFIG_KEYS = [
     "line_channel_access_token",
     "line_group_id",
@@ -32,30 +31,6 @@ def load_config():
     if missing:
         raise RuntimeError(f"config.json is missing values for: {', '.join(missing)}")
     return config
-
-
-def fetch_gold_prices():
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
-    resp = requests.get(
-        url,
-        params={"range": "6mo", "interval": "1d"},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    result = resp.json()["chart"]["result"][0]
-    quote = result["indicators"]["quote"][0]
-    df = pd.DataFrame({
-        "Date": pd.to_datetime(result["timestamp"], unit="s").normalize(),
-        "Open": quote["open"],
-        "High": quote["high"],
-        "Low": quote["low"],
-        "Close": quote["close"],
-    }).dropna()
-    df = df.sort_values("Date").tail(CHART_DAYS).reset_index(drop=True)
-    if df.empty:
-        raise RuntimeError("Yahoo Finance returned no gold price data")
-    return df
 
 
 def fetch_intraday_prices(interval=CANDLE_INTERVAL, range_param="5d"):
@@ -96,29 +71,97 @@ def make_chart(df, out_path):
         gridcolor="#2a2e39", gridstyle="--",
         rc={"axes.labelcolor": "#d1d4dc", "xtick.color": "#d1d4dc", "ytick.color": "#d1d4dc"},
     )
+    num = "".join(c for c in CANDLE_INTERVAL if c.isdigit())
+    unit = "".join(c for c in CANDLE_INTERVAL if c.isalpha()).upper()
+    label = f"{unit}{num}"
     mpf.plot(
         df, type="candle", style=style,
-        title=f"\nGold (XAU/USD futures) — M15, last {len(df)} candles",
+        title=f"\nGold (XAU/USD futures) — {label}, last {len(df)} candles",
         ylabel="Price (USD)",
         figsize=(10, 5.5),
         savefig=dict(fname=str(out_path), dpi=150),
     )
 
 
+def find_swings(df, order=SWING_ORDER):
+    """Local swing highs/lows: a candle whose High/Low is the extreme within its +/-order window."""
+    highs, lows = df["High"].values, df["Low"].values
+    swing_highs, swing_lows = [], []
+    for i in range(order, len(df) - order):
+        window = slice(i - order, i + order + 1)
+        if highs[i] == highs[window].max():
+            swing_highs.append((i, highs[i]))
+        if lows[i] == lows[window].min():
+            swing_lows.append((i, lows[i]))
+    return swing_highs, swing_lows
+
+
 def summarize_trend(df):
-    # PLACEHOLDER — replace with your own trend rules.
+    """Price-action read of the candles actually shown on the chart: market structure
+    (higher highs/lows vs lower highs/lows), momentum, the character of the latest candle,
+    and the nearest support/resistance."""
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    day_change_pct = (latest["Close"] - prev["Close"]) / prev["Close"] * 100
-    week = df.tail(7)
-    week_change_pct = (latest["Close"] - week.iloc[0]["Close"]) / week.iloc[0]["Close"] * 100
-    window_high = df["High"].max()
-    window_low = df["Low"].min()
+    is_bullish = latest["Close"] >= latest["Open"]
+    candle_range = latest["High"] - latest["Low"]
+    body = abs(latest["Close"] - latest["Open"])
+    body_ratio = body / candle_range if candle_range > 0 else 0
+    if body_ratio >= 0.6:
+        candle_strength = "strong"
+    elif body_ratio <= 0.25:
+        candle_strength = "indecisive"
+    else:
+        candle_strength = "moderate"
+
+    # Market structure from the last two swing highs and lows.
+    swing_highs, swing_lows = find_swings(df)
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        higher_highs = swing_highs[-1][1] > swing_highs[-2][1]
+        higher_lows = swing_lows[-1][1] > swing_lows[-2][1]
+        if higher_highs and higher_lows:
+            structure = "Uptrend (higher highs & higher lows)"
+        elif not higher_highs and not higher_lows:
+            structure = "Downtrend (lower highs & lower lows)"
+        else:
+            structure = "Ranging / mixed structure"
+    else:
+        structure = "Not enough swings yet to read structure"
+
+    # Momentum: consecutive candles closing the same direction, most recent first.
+    directions = (df["Close"] >= df["Open"]).values
+    streak = 1
+    for i in range(len(directions) - 1, 0, -1):
+        if directions[i] == directions[i - 1]:
+            streak += 1
+        else:
+            break
+    momentum_word = "bullish" if directions[-1] else "bearish"
+    momentum = (
+        f"{streak} consecutive {momentum_word} candles" if streak >= 2
+        else "no clear momentum (last candle flipped direction)"
+    )
+
+    # Support/resistance from the recent range, and whether price just broke out of it.
+    lookback = df.iloc[:-1].tail(30)
+    resistance = lookback["High"].max()
+    support = lookback["Low"].min()
+    near_pct = 0.0015  # ~0.15% counts as "testing" a level
+    if latest["Close"] > resistance:
+        level_note = f"Broke above resistance (${resistance:.2f})"
+    elif latest["Close"] < support:
+        level_note = f"Broke below support (${support:.2f})"
+    elif latest["Close"] >= resistance * (1 - near_pct):
+        level_note = f"Testing resistance (${resistance:.2f})"
+    elif latest["Close"] <= support * (1 + near_pct):
+        level_note = f"Testing support (${support:.2f})"
+    else:
+        level_note = f"Inside range (${support:.2f} - ${resistance:.2f})"
 
     return (
-        f"Gold {latest['Date'].strftime('%d %b %Y')}: ${latest['Close']:.2f}\n"
-        f"Day: {day_change_pct:+.2f}%  |  7d: {week_change_pct:+.2f}%\n"
-        f"{CHART_DAYS}d range: ${window_low:.2f} - ${window_high:.2f}"
+        f"Gold {CANDLE_INTERVAL.upper()} price action: ${latest['Close']:.2f}\n"
+        f"Structure: {structure}\n"
+        f"Momentum: {momentum}\n"
+        f"Last candle: {'Bullish' if is_bullish else 'Bearish'}, {candle_strength} (body {body_ratio*100:.0f}% of range)\n"
+        f"{level_note}"
     )
 
 
@@ -163,13 +206,12 @@ def send_to_line(channel_access_token, group_id, image_url, summary_text):
 
 def main():
     config = load_config()
-    df = fetch_gold_prices()
     intraday_df = fetch_intraday_prices()
 
     chart_path = Path(__file__).parent / "latest_chart.png"
     make_chart(intraday_df, chart_path)
 
-    summary = summarize_trend(df)
+    summary = summarize_trend(intraday_df)
     image_url = upload_image(config["imgbb_api_key"], chart_path)
     send_to_line(config["line_channel_access_token"], config["line_group_id"], image_url, summary)
 
